@@ -1,0 +1,92 @@
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    silhouette_score, 
+    davies_bouldin_score, 
+    calinski_harabasz_score
+)
+from sklearn.decomposition import PCA
+
+# ==============================================================================
+# TAHAP 2: EVALUASI METRIK KLASTER (CONTINUAL LEARNING)
+# (Menguji Nilai k = 2 hingga 6 Menggunakan 4 Metode Evaluasi)
+# ==============================================================================
+print("=== [1/2] EVALUASI METRIK KLASTER (k = 2 - 6) ===")
+
+k_range = range(2, 7)
+metrics_list = []
+
+# Pengujian iteratif untuk menemukan jumlah cluster optimal
+for k in k_range:
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(X_scaled)
+    
+    metrics_list.append({
+        "k": k, 
+        "WCSS": km.inertia_, 
+        "Silhouette": silhouette_score(X_scaled, labels), 
+        "Davies_Bouldin": davies_bouldin_score(X_scaled, labels), 
+        "Calinski_Harabasz": calinski_harabasz_score(X_scaled, labels)
+    })
+
+# Membuat Polars DataFrame untuk menyajikan hasil metrik evaluasi
+df_metrics = pl.DataFrame(metrics_list)
+print("Hasil Evaluasi Metrik Clustering:")
+print(df_metrics)
+print()
+
+# Visualisasi Grid 2x2 Evaluasi Metrik Ringkas & Presisi
+fig, axes = plt.subplots(2, 2, figsize=(7.5, 5.5), dpi=120)
+fig.subplots_adjust(hspace=0.38, wspace=0.32)
+
+plot_configs = [
+    (axes[0, 0], "WCSS", "Elbow Method (WCSS)", "#1f77b4", 'o'),
+    (axes[0, 1], "Silhouette", "Silhouette Score (Tinggi)", "#2ca02c", 's'),
+    (axes[1, 0], "Davies_Bouldin", "Davies-Bouldin Index (Rendah)", "#d62728", '^'),
+    (axes[1, 1], "Calinski_Harabasz", "Calinski-Harabasz Index (Tinggi)", "#9467bd", 'd')
+]
+
+for ax, col, title, color, marker in plot_configs:
+    ax.plot(df_metrics["k"], df_metrics[col], marker=marker, color=color, linewidth=1.5, markersize=5)
+    
+    # Menandai (Highlight) nilai pada k=3 pilihan
+    val_k3 = df_metrics.filter(pl.col("k") == 3)[col][0]
+    ax.scatter([3], [val_k3], color='gold', s=70, zorder=5, edgecolors='black', label='k=3')
+    
+    ax.set_title(title, fontsize=8.5, fontweight='bold', pad=5)
+    ax.set_xlabel("Jumlah Cluster (k)", fontsize=7.5)
+    ax.set_xticks(list(k_range))
+    ax.tick_params(labelsize=7.5)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(loc='best', fontsize=7)
+
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# TAHAP 3: K-MEANS CLUSTERING (k=3), INJEKSI LABEL & VISUALISASI PCA
+# ==============================================================================
+print("=== [2/2] K-MEANS CLUSTERING (k=3) & INJEKSI LABEL HASIL TERBARU ===")
+
+# 1. Melatih model K-Means dengan k=3 pada matriks ter-skala (X_scaled)
+kmeans_3 = KMeans(n_clusters=3, random_state=42, n_init=10)
+cluster_labels = kmeans_3.fit_predict(X_scaled)
+
+# 2. Injeksi Label Hasil Terbaru ke dalam Polars DataFrame (Variabel Target Baru)
+df_polars = df_polars.with_columns(pl.Series("Cluster_Label", cluster_labels))
+
+print("Distribusi Anggota Hasil Clustering (k=3):")
+print(df_polars.group_by("Cluster_Label").len().sort("Cluster_Label"))
+
+# 3. Reduksi Dimensi 2D Menggunakan PCA untuk Pemetaan Sebaran Cluster & Centroid
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+centroids_pca = pca.transform(kmeans_3.cluster_centers_)
+
+# 4. Visualisasi Scatter Plot PCA 2D
+fig, ax = plt.subplots(figsize=(7.5, 5), dpi=120)
+colors =
