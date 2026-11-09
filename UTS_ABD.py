@@ -3,12 +3,6 @@ import polars as pl
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ==============================================================================
-# KONFIGURASI TERMINAL WINDOWS & TAMPILAN TABEL POLARS
-# ==============================================================================
-sys.stdout.reconfigure(encoding='utf-8')
-pl.Config.set_tbl_formatting("ASCII_FULL")
-
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.metrics import (
@@ -22,14 +16,19 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.decomposition import PCA
 
-# Pengaturan Global Visualisasi Matplotlib
+# ==============================================================================
+# KONFIGURASI GLOBAL & TAMPILAN (SYSTEM & MATPLOTLIB)
+# ==============================================================================
+# 1. Mencegah UnicodeEncodeError di Terminal Windows
+sys.stdout.reconfigure(encoding='utf-8')
+pl.Config.set_tbl_formatting("ASCII_FULL")
+
+# 2. Pengaturan Presisi Visualisasi Matplotlib
 plt.rcParams['font.sans-serif'] = 'DejaVu Sans'
 plt.rcParams['axes.edgecolor'] = '#cccccc'
 plt.rcParams['axes.linewidth'] = 0.8
 
-# ==============================================================================
-# MAPPING NAMA SUB-SEKTOR UNTUK PENJELASAN HEATMAP YANG RAPI
-# ==============================================================================
+# 3. Dictionary Mapping Nama Sub-Sektor Industri (Agar Grafik Rapi & Terbaca)
 LABEL_MAP = {
     'Mining and quarrying B': 'Mining (B)',
     'Manufacture of food products, beverages and tobacco products CA': 'Food & Tobacco (CA)',
@@ -50,20 +49,21 @@ LABEL_MAP = {
     'Industry (excluding water and waste management) B+C+D': 'Industry (excl. water) B+C+D'
 }
 
+
 # ==============================================================================
-# 0. MEMBACA & PREPROCESSING DATA (POLARS)
+# TAHAP 1: PREPROCESSING DATA & IMPUTASI (POLARS)
 # ==============================================================================
+print("=== TAHAP 1: PREPROCESSING DATA & IMPUTASI ===")
 file_path = "stadat-ipa0037-13.2.1.7-en.xlsx"
 
+# 1. Baca Sheet Excel
 try:
     df_raw = pl.read_excel(file_path, sheet_id=1, has_header=False, engine="calamine")
 except Exception:
     df_raw = pl.read_excel(file_path, sheet_id=1, has_header=False)
 
-# Ambil header dari Baris Index 1
+# 2. Ambil & Format Nama Kolom dari Baris Index 1 (Baris ke-2 Excel)
 raw_headers = df_raw.row(1)
-
-# Penanganan nama kolom unik
 header_cols = []
 seen = {}
 for val in raw_headers:
@@ -75,55 +75,52 @@ for val in raw_headers:
         seen[name] = 0
     header_cols.append(name)
 
-# Slice data mulai baris index 3 (Data numerik)
+# 3. Slicing Data Numerik Utama & Forward Fill Kolom 'Year'
 df_polars = df_raw.slice(3)
 df_polars.columns = header_cols
-
-# Forward fill kolom Year
 df_polars = df_polars.with_columns(pl.col("Year").forward_fill())
 
-# Fitur numerik awal
+# 4. Filter Fitur Numerik & Pembersihan Nilai Kosong (Null)
 all_feature_cols = [c for c in header_cols if c not in ["Year", "Period Code"] and not c.startswith("Unnamed")]
-
-# Cast tipe data ke Float64 & bersihkan null
 exprs = [pl.col(c).cast(pl.Float64, strict=False) for c in all_feature_cols]
 df_polars = df_polars.with_columns(exprs).drop_nulls(subset=all_feature_cols)
 
-print(f"Data Berhasil Dimuat! Total Dataset: {df_polars.shape[0]} Baris x {df_polars.shape[1]} Kolom")
+print(f"[OK] Data Preprocessing Selesai. Dimensi Dataset: {df_polars.shape[0]} Baris x {df_polars.shape[1]} Kolom\n")
+
 
 # ==============================================================================
-# 1. FEATURE SELECTION VÍA CORRELATION THRESHOLD (|r| >= 0.4) & ANNOTATED HEATMAP
+# TAHAP 2: SELEKSI FITUR (CORRELATION THRESHOLD |r| >= 0.4) & HEATMAP
 # ==============================================================================
-print("\n--- 1. Melakukan Seleksi Variabel dengan Correlation Threshold (|r| >= 0.4) ---")
+print("=== TAHAP 2: SELEKSI FITUR & CORRELATION HEATMAP ===")
+
 X_all = df_polars.select(all_feature_cols).to_numpy()
 corr_full = np.corrcoef(X_all, rowvar=False)
 
-# Target referensi agregat: Industry (excluding water and waste management) B+C+D
+# Target Referensi: Industry (excluding water and waste management) B+C+D
 target_idx = all_feature_cols.index('Industry (excluding water and waste management) B+C+D')
 
-# Pilih variabel yang memiliki korelasi absolut >= 0.4
+# Saring hanya variabel dengan korelasi absolut |r| >= 0.4 terhadap target
 selected_indices = [i for i in range(len(all_feature_cols)) if abs(corr_full[i, target_idx]) >= 0.4]
 feature_cols = [all_feature_cols[i] for i in selected_indices]
 short_labels = [LABEL_MAP.get(c, c) for c in feature_cols]
 
-print(f"Variabel Terpilih (Threshold |r| >= 0.4): {len(feature_cols)} dari {len(all_feature_cols)} Variabel")
+print(f"[OK] Seleksi Fitur Selesai: {len(feature_cols)} Variabel Terpilih dari {len(all_feature_cols)} Variabel Awal")
 
-# Hitung korelasi untuk variabel terpilih
+# Matriks Korelasi Terpilih
 X_raw = df_polars.select(feature_cols).to_numpy()
 corr_matrix = np.corrcoef(X_raw, rowvar=False)
 
-# Visualisasi Heatmap (Ukuran Ringkas & Dilengkapi Angka di Dalam Kotak)
+# Visualisasi Correlation Heatmap Presisi (Dengan Angka Nilai Korelasi)
 fig, ax = plt.subplots(figsize=(7.5, 6), dpi=120)
 im = ax.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
 
-# Tambahkan Angka Korelasi di Setiap Sel Kotak Heatmap
+# Tampilkan angka presisi di setiap sel
 for i in range(len(feature_cols)):
     for j in range(len(feature_cols)):
         val = corr_matrix[i, j]
         text_color = "white" if abs(val) > 0.65 else "black"
         ax.text(j, i, f"{val:.2f}", ha="center", va="center", color=text_color, fontsize=6.5, fontweight="bold")
 
-# Colorbar & Sumbu
 cbar = fig.colorbar(im, ax=ax, shrink=0.82, pad=0.03)
 cbar.set_label('Koefisien Korelasi (r)', fontsize=8.5, fontweight='bold')
 cbar.ax.tick_params(labelsize=8)
@@ -137,14 +134,16 @@ ax.set_title("Correlation Heatmap (Filtered |r| ≥ 0.4)", fontsize=11, fontweig
 plt.tight_layout()
 plt.show()
 
-# Standardisasi Data Terpilih
+# Standardisasi Z-Score pada Data Terpilih
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X_raw)
+print("[OK] Standardisasi Z-Score Selesai.\n")
+
 
 # ==============================================================================
-# 2. CONTINUAL EVALUATION METRICS (4 METHOD RINGKAS: ELBOW, SILHOUETTE, DB, CHI)
+# TAHAP 3: EVALUASI KLASTER CONTINUAL (4 METODE: ELBOW, SILHOUETTE, DB, CHI)
 # ==============================================================================
-print("\n--- 2. Pengujian 4 Metode Evaluasi Klaster (k = 2 hingga 6) ---")
+print("=== TAHAP 3: EVALUASI METRIK KLASTER (k = 2 - 6) ===")
 k_range = range(2, 7)
 metrics_list = []
 
@@ -163,7 +162,7 @@ for k in k_range:
 df_metrics = pl.DataFrame(metrics_list)
 print(df_metrics)
 
-# Grid 2x2 Evaluasi Metrik (Ukuran Ringkas: 7.5 x 5.5)
+# Visualisasi Grid 2x2 Evaluasi Metrik Ringkas
 fig, axes = plt.subplots(2, 2, figsize=(7.5, 5.5), dpi=120)
 fig.subplots_adjust(hspace=0.38, wspace=0.32)
 
@@ -177,7 +176,7 @@ plot_configs = [
 for ax, col, title, color, marker in plot_configs:
     ax.plot(df_metrics["k"], df_metrics[col], marker=marker, color=color, linewidth=1.5, markersize=5)
     
-    # Highlight nilai optimal k=3
+    # Highlight nilai k=3
     val_k3 = df_metrics.filter(pl.col("k") == 3)[col][0]
     ax.scatter([3], [val_k3], color='gold', s=70, zorder=5, edgecolors='black', label='Selected (k=3)')
     
@@ -190,21 +189,23 @@ for ax, col, title, color, marker in plot_configs:
 
 plt.tight_layout()
 plt.show()
+print("[OK] Evaluasi 4 Metrik Selesai.\n")
+
 
 # ==============================================================================
-# 3. K-MEANS CLUSTERING (k=3) & PENAMBAHAN LABEL KE DATAFRAME
+# TAHAP 4: K-MEANS CLUSTERING (k=3) & INJEKSI LABEL BARU
 # ==============================================================================
-print("\n--- 3. Menjalankan K-Means Clustering (k=3) & Penambahan Label Hasil ---")
+print("=== TAHAP 4: K-MEANS CLUSTERING (k=3) & PENAMBAHAN LABEL ===")
 kmeans_3 = KMeans(n_clusters=3, random_state=42, n_init=10)
 cluster_labels = kmeans_3.fit_predict(X_scaled)
 
-# Menambahkan kolom label klaster ke Polars DataFrame
+# Penambahan Kolom Label Hasil Klaster Terakhir ke Dalam Polars DataFrame
 df_polars = df_polars.with_columns(pl.Series("Cluster_Label", cluster_labels))
 
 print("Distribusi Anggota Tiap Cluster (k=3):")
 print(df_polars.group_by("Cluster_Label").len().sort("Cluster_Label"))
 
-# Visualisasi PCA 2D Cluster
+# Visualisasi Sebaran 2D Klaster via PCA
 pca = PCA(n_components=2)
 X_pca = pca.fit_transform(X_scaled)
 centroids_pca = pca.transform(kmeans_3.cluster_centers_)
@@ -234,43 +235,49 @@ ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
 
 plt.tight_layout()
 plt.show()
+print("[OK] K-Means Clustering & Injeksi Label Selesai.\n")
+
 
 # ==============================================================================
-# 4. DATA SPLITTING & MACHINE LEARNING (RANDOM FOREST)
+# TAHAP 5: DATA SPLITTING (TRAIN 70%, VALIDATION 15%, TESTING 15%)
 # ==============================================================================
-print("\n--- 4. Data Splitting (Training 70%, Validation 15%, Testing 15%) ---")
+print("=== TAHAP 5: DATA SPLITTING (TRAIN, VALIDATION, TEST) ===")
 X = X_scaled
 y = df_polars["Cluster_Label"].to_numpy()
 
-# Split 1: Pisahkan 15% untuk Test Set
+# 1. Split Pertama: Pisahkan Test Set (15%)
 X_train_val, X_test, y_train_val, y_test = train_test_split(
     X, y, test_size=0.15, random_state=42, stratify=y
 )
 
-# Split 2: Pisahkan Training (70%) dan Validation (15%)
+# 2. Split Kedua: Membagi Sisa Data Menjadi Train (70%) dan Validation (15%)
 X_train, X_val, y_train, y_val = train_test_split(
     X_train_val, y_train_val, test_size=0.176, random_state=42, stratify=y_train_val
 )
 
-print(f"Ukuran Dataset -> Training: {len(X_train)} | Validation: {len(X_val)} | Testing: {len(X_test)}")
+print(f"[OK] Ukuran Dataset -> Training: {len(X_train)} | Validation: {len(X_val)} | Testing: {len(X_test)}\n")
 
-print("\n--- 5. Pelatihan Machine Learning (Random Forest) ---")
+
+# ==============================================================================
+# TAHAP 6: MACHINE LEARNING (RANDOM FOREST) & EVALUASI MODEL
+# ==============================================================================
+print("=== TAHAP 6: MACHINE LEARNING (RANDOM FOREST CLASSIFIER) ===")
 rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
 rf_model.fit(X_train, y_train)
 
-# Evaluasi Validation Set
+# 1. Evaluasi pada Validation Set (15%)
 val_preds = rf_model.predict(X_val)
-print(f"\nAkurasi Validation Set: {accuracy_score(y_val, val_preds) * 100:.2f}%")
+print(f"Akurasi Validation Set: {accuracy_score(y_val, val_preds) * 100:.2f}%")
 print("[ Classification Report Validation Set ]")
 print(classification_report(y_val, val_preds))
 
-# Evaluasi Test Set
+# 2. Evaluasi pada Test Set (15%)
 test_preds = rf_model.predict(X_test)
-print(f"\nAkurasi Test Set: {accuracy_score(y_test, test_preds) * 100:.2f}%")
+print(f"Akurasi Test Set: {accuracy_score(y_test, test_preds) * 100:.2f}%")
 print("[ Classification Report Test Set ]")
 print(classification_report(y_test, test_preds))
 
-# Feature Importance Bar Chart
+# 3. Visualisasi Top Feature Importance
 df_importance = pl.DataFrame({
     "Feature": [LABEL_MAP.get(c, c) for c in feature_cols],
     "Importance": rf_model.feature_importances_
@@ -288,3 +295,4 @@ ax.grid(True, axis='x', linestyle='--', alpha=0.5)
 
 plt.tight_layout()
 plt.show()
+print("=== SELURUH PROSES SELESAI ===")
