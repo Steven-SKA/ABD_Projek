@@ -1,1 +1,145 @@
+import sys
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
 
+# ==============================================================================
+# KONFIGURASI GLOBAL & TAMPILAN SYSTEM
+# ==============================================================================
+# Mencegah UnicodeEncodeError pada Terminal Windows & memformat tabel Polars
+sys.stdout.reconfigure(encoding='utf-8')
+pl.Config.set_tbl_formatting("ASCII_FULL")
+
+# Dictionary Penamaan Sub-Sektor Industri agar Rapi dan Informatif
+LABEL_MAP = {
+    'Mining and quarrying B': 'Mining (B)',
+    'Manufacture of food products, beverages and tobacco products CA': 'Food & Tobacco (CA)',
+    'Manufacture of textiles, apparel, leather and related products CB': 'Textiles & Leather (CB)',
+    'Manufacture of wood and paper products, and printing CC': 'Wood & Paper (CC)',
+    'Manufacture of coke, and refined petroleum products CD': 'Coke & Petroleum (CD)',
+    'Manufacture of chemicals and chemical products CE': 'Chemicals (CE)',
+    'Manufacture of pharma-ceuticals, medicinal chemical and botanical products CF': 'Pharma (CF)',
+    'Manufacture of rubber and plastics products, and other non-metallic mineral products CG': 'Rubber & Plastics (CG)',
+    'Manufacture of basic metals and fabricated metal products, except machinery and equipment CH': 'Basic Metals (CH)',
+    'Manufacture of computer, electronic and optical products CI': 'Electronics (CI)',
+    'Manufacture of electrical equipment CJ': 'Electrical Eq. (CJ)',
+    'Manufacture of machinery and equipment n.e.c. CK': 'Machinery (CK)',
+    'Manufacture of transport equipment CL': 'Transport Eq. (CL)',
+    'Other manufacturing, and repair and installation of machinery and equipment CM': 'Other Mfg. (CM)',
+    'Manufacturing C': 'Manufacturing (C)',
+    'Electricity, gas, steam and air conditioning supply D': 'Electricity & Gas (D)',
+    'Industry (excluding water and waste management) B+C+D': 'Industry (excl. water) B+C+D'
+}
+
+# ==============================================================================
+# TAHAP 1: BACA DATA & IMPUTASI STRUKTUR (POLARS)
+# ==============================================================================
+print("=== [1/3] BACA DATA & CLEANING HEADER ===")
+file_path = "stadat-ipa0037-13.2.1.7-en.xlsx"
+
+# 1. Loading file Excel tanpa header otomatis
+try:
+    df_raw = pl.read_excel(file_path, sheet_id=1, has_header=False, engine="calamine")
+except Exception:
+    df_raw = pl.read_excel(file_path, sheet_id=1, has_header=False)
+
+# 2. Extract & Sanitasi Nama Kolom dari Baris Index 1 (Baris ke-2 Excel)
+raw_headers = df_raw.row(1)
+header_cols = []
+seen = {}
+
+for val in raw_headers:
+    name = str(val).strip() if val is not None else "Unnamed"
+    if name in seen:
+        seen[name] += 1
+        name = f"{name}_{seen[name]}"
+    else:
+        seen[name] = 0
+    header_cols.append(name)
+
+# 3. Potong baris header, pasang nama kolom baru, dan terapkan Forward Fill pada 'Year'
+df_polars = df_raw.slice(3)
+df_polars.columns = header_cols
+df_polars = df_polars.with_columns(pl.col("Year").forward_fill())
+
+# 4. Tentukan kolom numerik awal & konversi tipe data ke Float64
+all_feature_cols = [c for c in header_cols if c not in ["Year", "Period Code"] and not c.startswith("Unnamed")]
+exprs = [pl.col(c).cast(pl.Float64, strict=False) for c in all_feature_cols]
+
+# 5. Drop baris yang memiliki nilai null pada fitur numerik (periode belum rilis)
+df_polars = df_polars.with_columns(exprs).drop_nulls(subset=all_feature_cols)
+
+print(f"Data Berhasil Dimuat & Dibersihkan:")
+print(f"- Total Sampel Valid : {df_polars.shape[0]} Bulan (Januari 2022 - Agustus 2026)")
+print(f"- Total Fitur Awal   : {len(all_feature_cols)} Sub-Sektor Industri\n")
+
+
+# ==============================================================================
+# TAHAP 2: SELEKSI FITUR DENGAN CORRELATION THRESHOLD (|r| >= 0.4)
+# ==============================================================================
+print("=== [2/3] SELEKSI FITUR BERBASIS THRESHOLD KORELASI (|r| >= 0.4) ===")
+
+# 1. Ekstraksi matriks NumPy & Hitung Korelasi Pearson Awal
+X_all = df_polars.select(all_feature_cols).to_numpy()
+corr_full = np.corrcoef(X_all, rowvar=False)
+
+# 2. Tentukan indeks variabel referensi agregat utama
+target_col_name = 'Industry (excluding water and waste management) B+C+D'
+target_idx = all_feature_cols.index(target_col_name)
+
+# 3. Filter variabel yang memenuhi ambang batas korelasi |r| >= 0.4 terhadap target
+selected_indices = [i for i in range(len(all_feature_cols)) if abs(corr_full[i, target_idx]) >= 0.4]
+feature_cols = [all_feature_cols[i] for i in selected_indices]
+discarded_cols = [c for c in all_feature_cols if c not in feature_cols]
+
+print(f"Hasil Seleksi Fitur:")
+print(f"- Fitur Lolos Threshold (|r| >= 0.4) : {len(feature_cols)} Variabel")
+print(f"- Fitur Dibuang (Korelasi < 0.4)     : {len(discarded_cols)} Variabel")
+print("  Daftar Fitur Dibuang:")
+for col in discarded_cols:
+    print(f"   * {LABEL_MAP.get(col, col)} (r = {corr_full[all_feature_cols.index(col), target_idx]:.3f})")
+print()
+
+# 4. Matriks Korelasi untuk Fitur Terpilih
+X_raw = df_polars.select(feature_cols).to_numpy()
+corr_matrix = np.corrcoef(X_raw, rowvar=False)
+short_labels = [LABEL_MAP.get(c, c) for c in feature_cols]
+
+# 5. Visualisasi Correlation Heatmap Presisi dengan Nilai Angka
+fig, ax = plt.subplots(figsize=(7.5, 6), dpi=120)
+im = ax.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+
+# Annotate nilai korelasi presisi di setiap sel heatmap
+for i in range(len(feature_cols)):
+    for j in range(len(feature_cols)):
+        val = corr_matrix[i, j]
+        text_color = "white" if abs(val) > 0.65 else "black"
+        ax.text(j, i, f"{val:.2f}", ha="center", va="center", color=text_color, fontsize=6.5, fontweight="bold")
+
+cbar = fig.colorbar(im, ax=ax, shrink=0.82, pad=0.03)
+cbar.set_label('Koefisien Korelasi (r)', fontsize=8.5, fontweight='bold')
+cbar.ax.tick_params(labelsize=8)
+
+ax.set_xticks(np.arange(len(feature_cols)))
+ax.set_yticks(np.arange(len(feature_cols)))
+ax.set_xticklabels(short_labels, rotation=45, ha='right', fontsize=7.5, fontweight='semibold')
+ax.set_yticklabels(short_labels, fontsize=7.5, fontweight='semibold')
+ax.set_title("Correlation Heatmap (Filtered |r| ≥ 0.4)", fontsize=11, fontweight='bold', pad=12)
+
+plt.tight_layout()
+plt.show()
+
+
+# ==============================================================================
+# TAHAP 3: STANDARDISASI SKALA (Z-SCORE SCALING)
+# ==============================================================================
+print("=== [3/3] STANDARDISASI SKALA FITUR (Z-SCORE SCALING) ===")
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_raw)
+
+print(f"Standardisasi Z-Score Selesai!")
+print(f"- Rata-rata (Mean) Matriks Ter-skala   : {np.mean(X_scaled):.4f} (~0)")
+print(f"- Standar Deviasi Matriks Ter-skala    : {np.std(X_scaled):.4f} (~1)")
+print(f"- Matriks `X_scaled` siap digunakan untuk tahap Clustering K-Means.\n")
