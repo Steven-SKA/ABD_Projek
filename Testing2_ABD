@@ -1,0 +1,318 @@
+from pathlib import Path
+import sys
+import warnings
+import polars as pl
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    silhouette_score,
+    davies_bouldin_score,
+    calinski_harabasz_score,
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
+
+warnings.filterwarnings("ignore", category=UserWarning)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+#Penjelasan Konfigurasi path file, folder output, parameter model, dan pemetaan label grafik
+BASE_DIR = Path(__file__).resolve().parent
+FILE_PATH = BASE_DIR / "stadat-ipa0037-13.2.1.7-en.xlsx"
+OUTPUT_DIR = BASE_DIR / "hasil_analisis"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+CORRELATION_THRESHOLD = 0.40
+REFERENCE_FEATURE = "Industry (excluding water and waste management) B+C+D"
+EXCLUDED_AGGREGATES = {"Manufacturing C", REFERENCE_FEATURE}
+SELECTED_K = 3
+K_RANGE = range(2, 7)
+RANDOM_STATE = 42
+
+LABEL_MAP = {
+    "Mining and quarrying B": "Mining (B)",
+    "Manufacture of food products, beverages and tobacco products CA": "Food & Tobacco (CA)",
+    "Manufacture of textiles, apparel, leather and related products CB": "Textiles & Leather (CB)",
+    "Manufacture of wood and paper products, and printing CC": "Wood & Paper (CC)",
+    "Manufacture of coke, and refined petroleum products CD": "Coke & Petroleum (CD)",
+    "Manufacture of chemicals and chemical products CE": "Chemicals (CE)",
+    "Manufacture of pharma-ceuticals, medicinal chemical and botanical products CF": "Pharma (CF)",
+    "Manufacture of rubber and plastics products, and other non-metallic mineral products CG": "Rubber & Plastics (CG)",
+    "Manufacture of basic metals and fabricated metal products, except machinery and equipment CH": "Basic Metals (CH)",
+    "Manufacture of computer, electronic and optical products CI": "Electronics (CI)",
+    "Manufacture of electrical equipment CJ": "Electrical Eq. (CJ)",
+    "Manufacture of machinery and equipment n.e.c. CK": "Machinery (CK)",
+    "Manufacture of transport equipment CL": "Transport Eq. (CL)",
+    "Other manufacturing, and repair and installation of machinery and equipment CM": "Other Mfg. (CM)",
+    "Manufacturing C": "Manufacturing (C)",
+    "Electricity, gas, steam and air conditioning supply D": "Electricity & Gas (D)",
+    "Industry (excluding water and waste management) B+C+D": "Industry (B+C+D)",
+}
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 8,
+    "axes.titlesize": 9,
+    "axes.labelsize": 8,
+    "axes.edgecolor": "#cccccc",
+    "axes.linewidth": 0.8,
+})
+
+
+def print_section(title: str) -> None:
+    print(f"\n{'=' * 65}\n{title}\n{'=' * 65}")
+
+
+#Penjelasan Tahap 1: Membaca Excel, merapikan header, mengecek missing values, dan menyimpan data bersih
+def load_dataset(file_path: Path) -> pl.DataFrame:
+    raw = pl.read_excel(file_path, sheet_id=1, has_header=False, engine="calamine")
+
+    headers, seen = [], {}
+    for value in raw.row(1):
+        name = str(value).strip() if value is not None else "Unnamed"
+        seen[name] = seen.get(name, -1) + 1
+        headers.append(f"{name}_{seen[name]}" if seen[name] > 0 else name)
+
+    df = raw.slice(3)
+    df.columns = headers
+
+    feature_candidates = [
+        col for col in df.columns
+        if col not in {"Year", "Period Code"} and not col.startswith("Unnamed")
+    ]
+
+    df = df.with_columns(
+        pl.col("Year").cast(pl.String, strict=False).forward_fill(),
+        pl.col("Period Code").cast(pl.String, strict=False).str.strip_chars(),
+        *[pl.col(col).cast(pl.Float64, strict=False) for col in feature_candidates],
+    )
+
+    original_rows = df.height
+    missing_summary = pl.DataFrame({
+        "Feature": feature_candidates,
+        "Missing_Values": [df[col].null_count() for col in feature_candidates],
+    })
+    print(f"Baris sebelum pembersihan: {original_rows}")
+    print(missing_summary)
+
+    df = (
+        df.drop_nulls(subset=["Year", "Period Code"] + feature_candidates)
+        .with_columns(pl.col("Year").cast(pl.Int32, strict=True))
+    )
+    print(f"Baris lengkap: {df.height} | Dihapus: {original_rows - df.height}")
+    return df
+
+
+#Penjelasan Tahap 2: Membagi indeks dataset secara kronologis (70% train, 15% val, 15% test)
+def chronological_split(n_rows: int):
+    train_end = int(n_rows * 0.70)
+    validation_end = int(n_rows * 0.85)
+    return slice(0, train_end), slice(train_end, validation_end), slice(validation_end, n_rows)
+
+
+#Penjelasan Visualisasi correlation heatmap berangka dengan ukuran ringkas
+def plot_correlation_heatmap(corr: np.ndarray, labels: list[str], out_path: Path):
+    fig, ax = plt.subplots(figsize=(6.5, 5.0), dpi=100)
+    image = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
+
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            value = corr[i, j]
+            color = "white" if abs(value) >= 0.65 else "black"
+            ax.text(j, i, f"{value:.2f}", ha="center", va="center", color=color, fontsize=6.5, fontweight="bold")
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_title(f"Correlation Heatmap (Training, |r| >= {CORRELATION_THRESHOLD})", fontweight="bold", pad=10)
+    fig.colorbar(image, ax=ax, shrink=0.8).set_label("Pearson Correlation (r)", fontsize=7.5)
+    plt.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def main():
+    #Penjelasan Menjalankan Tahap 1 preprocessing data dan menyimpan hasilnya ke CSV
+    print_section("TAHAP 1 - PREPROCESSING DATA (POLARS)")
+    df = load_dataset(FILE_PATH)
+    feature_all = [col for col in df.columns if col not in {"Year", "Period Code"}]
+
+    print(f"Rentang: {df['Period Code'][0]} {df['Year'][0]} - {df['Period Code'][-1]} {df['Year'][-1]}")
+    print(df.head(5))
+    df.write_csv(OUTPUT_DIR / "data_preprocessing_bersih.csv")
+
+    #Penjelasan Menjalankan Tahap 2 pembagian data kronologis 70:15:15
+    print_section("TAHAP 2 - PEMBAGIAN DATA KRONOLOGIS")
+    train_s, val_s, test_s = chronological_split(df.height)
+    train_df = df.slice(train_s.start, train_s.stop - train_s.start)
+    val_df = df.slice(val_s.start, val_s.stop - val_s.start)
+    test_df = df.slice(test_s.start, test_s.stop - test_s.start)
+    print(f"Train: {train_df.height} | Validation: {val_df.height} | Testing: {test_df.height}")
+
+    #Penjelasan Menjalankan Tahap 3 seleksi fitur korelasi pada data training dan membuat heatmap
+    print_section("TAHAP 3 - SELEKSI FITUR DAN CORRELATION HEATMAP")
+    corr_train_all = np.corrcoef(train_df.select(feature_all).to_numpy(), rowvar=False)
+    ref_idx = feature_all.index(REFERENCE_FEATURE)
+
+    selected_features, selection_rows = [], []
+    for i, feature in enumerate(feature_all):
+        correlation = float(corr_train_all[i, ref_idx])
+        excluded = feature in EXCLUDED_AGGREGATES
+        selected = abs(correlation) >= CORRELATION_THRESHOLD and not excluded and np.isfinite(correlation)
+        selection_rows.append({
+            "Feature": feature,
+            "Correlation_with_reference": correlation,
+            "Absolute_Correlation": abs(correlation) if np.isfinite(correlation) else None,
+            "Selected": selected,
+            "Reason": (
+                "Dipilih: memenuhi threshold" if selected else
+                "Dikecualikan: feature agregat" if excluded else
+                "Tidak memenuhi threshold"
+            ),
+        })
+        if selected:
+            selected_features.append(feature)
+
+    df_selection = pl.DataFrame(selection_rows).sort("Absolute_Correlation", descending=True, nulls_last=True)
+    df_selection.write_csv(OUTPUT_DIR / "laporan_seleksi_fitur.csv")
+    print(f"Feature terpilih: {len(selected_features)} dari {len(feature_all)}")
+    print(df_selection)
+
+    X_train_raw = train_df.select(selected_features).to_numpy()
+    short_labels = [LABEL_MAP.get(col, col) for col in selected_features]
+    plot_correlation_heatmap(
+        np.corrcoef(X_train_raw, rowvar=False), short_labels, OUTPUT_DIR / "01_correlation_heatmap.png"
+    )
+
+    #Penjelasan Menjalankan Tahap 4 standardisasi Z-score (fit pada training, transform ke semua data)
+    print_section("TAHAP 4 - STANDARDISASI Z-SCORE")
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_raw)
+    X_val = scaler.transform(val_df.select(selected_features).to_numpy())
+    X_test = scaler.transform(test_df.select(selected_features).to_numpy())
+    X_all = scaler.transform(df.select(selected_features).to_numpy())
+    print("StandardScaler berhasil diterapkan pada train, validation, dan test.")
+
+    #Penjelasan Menjalankan Tahap 5 evaluasi 4 metrik cluster (Elbow, Silhouette, DBI, CHI)
+    print_section("TAHAP 5 - EVALUASI CLUSTER (ELBOW, SILHOUETTE, DBI, CHI)")
+    metric_rows = []
+    for k in K_RANGE:
+        model = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=20)
+        labels = model.fit_predict(X_train)
+        metric_rows.append({
+            "k": k,
+            "WCSS": float(model.inertia_),
+            "Silhouette": float(silhouette_score(X_train, labels)),
+            "Davies_Bouldin": float(davies_bouldin_score(X_train, labels)),
+            "Calinski_Harabasz": float(calinski_harabasz_score(X_train, labels)),
+        })
+
+    df_metrics = pl.DataFrame(metric_rows)
+    print(df_metrics)
+    df_metrics.write_csv(OUTPUT_DIR / "hasil_evaluasi_cluster.csv")
+
+    fig, axes = plt.subplots(2, 2, figsize=(7.5, 5.0), dpi=100)
+    configs = [
+        (axes[0, 0], "WCSS", "Elbow Method (WCSS)", "#1f77b4", "o"),
+        (axes[0, 1], "Silhouette", "Silhouette Score (Tinggi)", "#2ca02c", "s"),
+        (axes[1, 0], "Davies_Bouldin", "Davies-Bouldin (Rendah)", "#d62728", "^"),
+        (axes[1, 1], "Calinski_Harabasz", "Calinski-Harabasz (Tinggi)", "#9467bd", "d"),
+    ]
+    for ax, column, title, color, marker in configs:
+        ax.plot(df_metrics["k"].to_list(), df_metrics[column].to_list(), marker=marker, color=color, linewidth=1.5, markersize=4)
+        chosen_value = df_metrics.filter(pl.col("k") == SELECTED_K)[column][0]
+        ax.scatter([SELECTED_K], [chosen_value], color="gold", edgecolors="black", s=65, zorder=5, label=f"k={SELECTED_K}")
+        ax.set_title(title, fontweight="bold", fontsize=8.5)
+        ax.set_xlabel("Jumlah cluster (k)", fontsize=7.5)
+        ax.set_xticks(list(K_RANGE))
+        ax.grid(True, linestyle="--", alpha=0.4)
+        ax.legend(fontsize=7)
+    plt.tight_layout()
+    fig.savefig(OUTPUT_DIR / "02_evaluasi_jumlah_cluster.png", bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+    #Penjelasan Menjalankan Tahap 6 clustering K-Means k=3, penambahan label ke Polars, dan plot PCA 2D
+    print_section("TAHAP 6 - K-MEANS CLUSTERING (k=3) DAN PENAMBAHAN LABEL")
+    kmeans = KMeans(n_clusters=SELECTED_K, random_state=RANDOM_STATE, n_init=20)
+    y_train_c = kmeans.fit_predict(X_train)
+    y_val_c = kmeans.predict(X_val)
+    y_test_c = kmeans.predict(X_test)
+    y_all_c = np.concatenate([y_train_c, y_val_c, y_test_c])
+
+    df_result = df.with_columns(pl.Series("Cluster_Label", y_all_c))
+    print(df_result.group_by("Cluster_Label").len().sort("Cluster_Label"))
+    df_result.write_csv(OUTPUT_DIR / "hasil_clustering_dengan_label.csv")
+
+    pca = PCA(n_components=2).fit(X_train)
+    X_all_pca = pca.transform(X_all)
+    centroids_pca = pca.transform(kmeans.cluster_centers_)
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.3), dpi=100)
+    for cid, color in enumerate(["#e41a1c", "#377eb8", "#4daf4a"]):
+        mask = y_all_c == cid
+        ax.scatter(X_all_pca[mask, 0], X_all_pca[mask, 1], color=color, label=f"Cluster {cid}", s=35, alpha=0.85)
+    ax.scatter(centroids_pca[:, 0], centroids_pca[:, 1], color="black", marker="X", s=110, label="Centroid", zorder=5)
+    ax.set_title("Visualisasi 3 Cluster K-Means via PCA 2D", fontweight="bold")
+    ax.set_xlabel(f"PCA 1 ({pca.explained_variance_ratio_[0] * 100:.1f}% variance)")
+    ax.set_ylabel(f"PCA 2 ({pca.explained_variance_ratio_[1] * 100:.1f}% variance)")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend(fontsize=7)
+    plt.tight_layout()
+    fig.savefig(OUTPUT_DIR / "03_visualisasi_kmeans_pca.png", bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+    #Penjelasan Menjalankan Tahap 7 pelatihan Random Forest, evaluasi metrik, dan feature importance
+    print_section("TAHAP 7 - RANDOM FOREST DAN EVALUASI MODEL")
+    rf = RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE, class_weight="balanced", n_jobs=-1)
+    rf.fit(X_train, y_train_c)
+
+    report_rows = []
+    for name, X_part, y_part in [("TRAINING", X_train, y_train_c), ("VALIDATION", X_val, y_val_c), ("TESTING", X_test, y_test_c)]:
+        preds = rf.predict(X_part)
+        acc = accuracy_score(y_part, preds)
+        report_rows.append({"Dataset": name, "Accuracy": acc, "Jumlah_Data": len(y_part)})
+        print(f"\n[{name}] Accuracy: {acc * 100:.2f}%")
+        print(classification_report(y_part, preds, labels=[0, 1, 2], target_names=["Cluster 0", "Cluster 1", "Cluster 2"], zero_division=0))
+        print("Confusion Matrix:\n", confusion_matrix(y_part, preds, labels=[0, 1, 2]))
+
+    df_report = pl.DataFrame(report_rows)
+    print("\nRingkasan Evaluasi:\n", df_report)
+    df_report.write_csv(OUTPUT_DIR / "evaluasi_random_forest.csv")
+
+    df_importance = pl.DataFrame({
+        "Feature": short_labels,
+        "Importance": rf.feature_importances_,
+    }).sort("Importance", descending=True)
+    print("\nFeature Importance:\n", df_importance)
+    df_importance.write_csv(OUTPUT_DIR / "feature_importance_random_forest.csv")
+    pl.DataFrame({"Feature_Model": selected_features}).write_csv(OUTPUT_DIR / "daftar_feature_model.csv")
+
+    fig, ax = plt.subplots(figsize=(6.8, 4.2), dpi=100)
+    bars = ax.barh(df_importance["Feature"].to_list()[::-1], df_importance["Importance"].to_list()[::-1], color="#008080")
+    ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=7, fontweight="bold")
+    ax.set_xlim(0, df_importance["Importance"].max() * 1.18)
+    ax.set_xlabel("Importance Score")
+    ax.set_title("Feature Importance - Random Forest", fontweight="bold")
+    ax.grid(True, axis="x", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    fig.savefig(OUTPUT_DIR / "04_feature_importance_random_forest.png", bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+    print_section(f"SELESAI - Output tersimpan di: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
